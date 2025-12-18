@@ -302,24 +302,55 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
     public function process_payment($order_id) {
         $order = wc_get_order($order_id);
         $customer_id = $order->get_user_id();
+        $is_guest = ($customer_id == 0);
 
         try {
-            // Get verified org_id and paytoken_id from user meta
-            $org_id = get_user_meta($customer_id, '_monarch_org_id', true);
-            $paytoken_id = get_user_meta($customer_id, '_monarch_paytoken_id', true);
+            if ($is_guest) {
+                // For guest checkout, get data from session
+                $org_id = WC()->session->get('monarch_org_id');
+                $paytoken_id = WC()->session->get('monarch_paytoken_id');
+                $org_api_key = WC()->session->get('monarch_org_api_key');
+                $org_app_id = WC()->session->get('monarch_org_app_id');
+                $monarch_user_id = WC()->session->get('monarch_user_id');
+                
+                // Store data in order meta for future reference
+                if ($org_id) $order->update_meta_data('_monarch_org_id', $org_id);
+                if ($paytoken_id) $order->update_meta_data('_monarch_paytoken_id', $paytoken_id);
+                if ($monarch_user_id) $order->update_meta_data('_monarch_user_id', $monarch_user_id);
+                if ($org_api_key) $order->update_meta_data('_monarch_org_api_key', $org_api_key);
+                if ($org_app_id) $order->update_meta_data('_monarch_org_app_id', $org_app_id);
+                $order->save();
+            } else {
+                // For logged-in users, get verified org_id and paytoken_id from user meta
+                $org_id = get_user_meta($customer_id, '_monarch_org_id', true);
+                $paytoken_id = get_user_meta($customer_id, '_monarch_paytoken_id', true);
+                $org_api_key = get_user_meta($customer_id, '_monarch_org_api_key', true);
+                $org_app_id = get_user_meta($customer_id, '_monarch_org_app_id', true);
+            }
 
             // Bank account must be connected through Monarch's verification flow
             if (!$org_id || !$paytoken_id) {
                 throw new Exception('Please connect your bank account before placing an order.');
             }
 
-            // Get the purchaser org's API credentials (required for sale transactions)
-            $org_api_key = get_user_meta($customer_id, '_monarch_org_api_key', true);
-            $org_app_id = get_user_meta($customer_id, '_monarch_org_app_id', true);
-
-            // Use purchaser org's credentials if available, otherwise fall back to merchant credentials
-            $api_key_for_sale = $org_api_key ?: $this->api_key;
-            $app_id_for_sale = $org_app_id ?: $this->app_id;
+            // CRITICAL: Ensure credential consistency to avoid "Paytoken is Invalid" errors
+            // The same credentials used to create the paytoken MUST be used for the transaction
+            
+            if ($org_api_key && $org_app_id) {
+                // Use purchaser org's credentials (preferred for transactions)
+                $api_key_for_sale = $org_api_key;
+                $app_id_for_sale = $org_app_id;
+                $order->add_order_note('Using purchaser org credentials for transaction (credential consistency)');
+            } else {
+                // No purchaser credentials available - this could cause "Paytoken is Invalid" error
+                // Let's verify the paytoken with merchant credentials first
+                $order->add_order_note('WARNING: No purchaser credentials found, using merchant credentials. May cause paytoken validation issues.');
+                $api_key_for_sale = $this->api_key;
+                $app_id_for_sale = $this->app_id;
+                
+                // Add additional logging for debugging
+                error_log("Monarch ACH: Using merchant credentials for transaction. OrgId: $org_id, PaytokenId: $paytoken_id");
+            }
 
             $monarch_api = new Monarch_API(
                 $api_key_for_sale,
@@ -330,8 +361,12 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
             );
 
             $order->add_order_note('Using verified bank account - orgId: ' . $org_id . ', payTokenId: ' . $paytoken_id);
-            if ($org_api_key) {
-                $order->add_order_note('Using purchaser org credentials for transaction');
+            
+            // BEFORE creating transaction, verify paytoken exists with current credentials
+            $paytoken_validation = $this->validate_paytoken_with_credentials($org_id, $paytoken_id, $api_key_for_sale, $app_id_for_sale);
+            
+            if (!$paytoken_validation['valid']) {
+                throw new Exception('Paytoken validation failed: ' . $paytoken_validation['error'] . '. Please reconnect your bank account.');
             }
 
             // Create Sale Transaction
@@ -586,8 +621,15 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
     public function ajax_create_organization() {
         check_ajax_referer('monarch_ach_nonce', 'nonce');
 
-        if (!is_user_logged_in()) {
-            wp_send_json_error('User must be logged in');
+        // Support both logged in users and guest checkout
+        $is_guest = !is_user_logged_in();
+        
+        if ($is_guest) {
+            // For guest checkout, require session ID for data storage
+            if (!WC()->session || !WC()->session->get_session_cookie()) {
+                wp_send_json_error('Session required for guest checkout');
+                return;
+            }
         }
 
         // Log credentials being used for debugging
@@ -610,8 +652,16 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
                 $this->testmode
             );
             
-            // Get current user data
-            $current_user = wp_get_current_user();
+            // Get user data - support both logged in users and guest checkout
+            if ($is_guest) {
+                // For guest checkout, use billing email from form
+                $user_email = sanitize_email($_POST['billing_email']);
+                $user_id = 'guest_' . substr(md5($user_email . time()), 0, 8);
+            } else {
+                $current_user = wp_get_current_user();
+                $user_email = $current_user->user_email;
+                $user_id = $current_user->ID;
+            }
             
             // Prepare customer data
             $phone = preg_replace('/[^0-9]/', '', sanitize_text_field($_POST['monarch_phone']));
@@ -621,14 +671,12 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
             $dob = date('m/d/Y', strtotime($dob_raw)); // Convert to mm/dd/yyyy
 
             // Generate unique email for Monarch to avoid "email already in use" errors
-            // Use WordPress user ID + timestamp to ensure uniqueness
-            $user_email = $current_user->user_email;
             $email_parts = explode('@', $user_email);
-            $unique_email = $email_parts[0] . '+wp' . $current_user->ID . '_' . time() . '@' . ($email_parts[1] ?? 'example.com');
+            $unique_email = $email_parts[0] . '+wp' . $user_id . '_' . time() . '@' . ($email_parts[1] ?? 'example.com');
 
             $customer_data = array(
-                'first_name' => $current_user->user_firstname ?: sanitize_text_field($_POST['billing_first_name']),
-                'last_name' => $current_user->user_lastname ?: sanitize_text_field($_POST['billing_last_name']),
+                'first_name' => $is_guest ? sanitize_text_field($_POST['billing_first_name']) : ($current_user->user_firstname ?: sanitize_text_field($_POST['billing_first_name'])),
+                'last_name' => $is_guest ? sanitize_text_field($_POST['billing_last_name']) : ($current_user->user_lastname ?: sanitize_text_field($_POST['billing_last_name'])),
                 'email' => $unique_email,
                 'password' => wp_generate_password(12, false),
                 'phone' => $phone,
@@ -690,9 +738,17 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
             }
             
             // Save organization data temporarily (will be permanent after bank connection)
-            $customer_id = get_current_user_id();
-            update_user_meta($customer_id, '_monarch_temp_org_id', $org_id);
-            update_user_meta($customer_id, '_monarch_temp_user_id', $user_id);
+            if ($is_guest) {
+                // For guest users, store in WooCommerce session
+                WC()->session->set('monarch_temp_org_id', $org_id);
+                WC()->session->set('monarch_temp_user_id', $user_id);
+                WC()->session->set('monarch_temp_api_data', $org_result['data']);
+            } else {
+                // For logged-in users, store in user meta
+                $customer_id = get_current_user_id();
+                update_user_meta($customer_id, '_monarch_temp_org_id', $org_id);
+                update_user_meta($customer_id, '_monarch_temp_user_id', $user_id);
+            }
 
             // Store the purchaser org's API credentials for transactions
             // The Monarch API returns credentials in response.data.api.sandbox or response.data.api.prod
@@ -717,20 +773,39 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
                 $purchaser_app_id = $org_result['data']['appId'] ?? $org_result['data']['app_id'] ?? null;
             }
 
-            // Save purchaser credentials if found
+            // Save purchaser credentials if found - CRITICAL for avoiding paytoken errors
             if ($purchaser_api_key && $purchaser_app_id) {
-                update_user_meta($customer_id, '_monarch_temp_org_api_key', $purchaser_api_key);
-                update_user_meta($customer_id, '_monarch_temp_org_app_id', $purchaser_app_id);
+                if ($is_guest) {
+                    // For guest users, store in session
+                    WC()->session->set('monarch_temp_org_api_key', $purchaser_api_key);
+                    WC()->session->set('monarch_temp_org_app_id', $purchaser_app_id);
+                } else {
+                    // For logged-in users, store in user meta
+                    update_user_meta($customer_id, '_monarch_temp_org_api_key', $purchaser_api_key);
+                    update_user_meta($customer_id, '_monarch_temp_org_app_id', $purchaser_app_id);
+                }
+                
                 $logger->debug('Purchaser credentials saved', array(
                     'api_key_last_4' => substr($purchaser_api_key, -4),
-                    'app_id' => $purchaser_app_id
+                    'app_id' => $purchaser_app_id,
+                    'user_type' => $is_guest ? 'guest' : 'logged_in'
                 ));
             } else {
-                // Log warning - credentials not found, will fall back to merchant credentials
-                $logger->debug('Purchaser credentials NOT found in response - will use merchant credentials', array(
+                // WARNING: Without purchaser credentials, transactions may fail with "Paytoken is Invalid"
+                $logger->warning('Purchaser credentials NOT found in response - transactions may fail', array(
                     'org_result_keys' => array_keys($org_result['data'] ?? []),
-                    'api_structure' => $org_api ? array_keys($org_api) : 'null'
+                    'api_structure' => $org_api ? array_keys($org_api) : 'null',
+                    'user_type' => $is_guest ? 'guest' : 'logged_in'
                 ));
+                
+                // Still attempt to save any partial credentials found
+                if ($is_guest) {
+                    if ($purchaser_api_key) WC()->session->set('monarch_temp_org_api_key', $purchaser_api_key);
+                    if ($purchaser_app_id) WC()->session->set('monarch_temp_org_app_id', $purchaser_app_id);
+                } else {
+                    if ($purchaser_api_key) update_user_meta($customer_id, '_monarch_temp_org_api_key', $purchaser_api_key);
+                    if ($purchaser_app_id) update_user_meta($customer_id, '_monarch_temp_org_app_id', $purchaser_app_id);
+                }
             }
 
             // Log organization creation
@@ -769,13 +844,25 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
     public function ajax_bank_connection_complete() {
         check_ajax_referer('monarch_ach_nonce', 'nonce');
 
-        if (!is_user_logged_in()) {
-            wp_send_json_error('User must be logged in');
+        // Support both logged in users and guest checkout
+        $is_guest = !is_user_logged_in();
+        
+        if ($is_guest) {
+            // For guest checkout, get data from session
+            $org_id = WC()->session->get('monarch_temp_org_id');
+        } else {
+            // For logged-in users, get from user meta
+            $customer_id = get_current_user_id();
+            $org_id = get_user_meta($customer_id, '_monarch_temp_org_id', true);
         }
-
-        $customer_id = get_current_user_id();
-        $org_id = get_user_meta($customer_id, '_monarch_temp_org_id', true);
-        $user_id = get_user_meta($customer_id, '_monarch_temp_user_id', true);
+        
+        // Get user_id based on user type
+        if ($is_guest) {
+            $user_id = WC()->session->get('monarch_temp_user_id');
+        } else {
+            $user_id = get_user_meta($customer_id, '_monarch_temp_user_id', true);
+        }
+        
         $paytoken_id = sanitize_text_field($_POST['paytoken_id']);
 
         if (!$org_id || !$user_id || !$paytoken_id) {
@@ -794,25 +881,38 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
                 'flow' => 'embedded_bank_linking'
             ));
 
-            // Save permanent user data
-            update_user_meta($customer_id, '_monarch_org_id', $org_id);
-            update_user_meta($customer_id, '_monarch_user_id', $user_id);
-            update_user_meta($customer_id, '_monarch_paytoken_id', $paytoken_id);
-            update_user_meta($customer_id, '_monarch_connected_date', current_time('mysql'));
+            // Save permanent data based on user type
+            if ($is_guest) {
+                // For guest users, store in session (will be moved to order meta during checkout)
+                WC()->session->set('monarch_org_id', $org_id);
+                WC()->session->set('monarch_user_id', $user_id);
+                WC()->session->set('monarch_paytoken_id', $paytoken_id);
+                WC()->session->set('monarch_connected_date', current_time('mysql'));
+                
+                // Clean up temporary session data
+                WC()->session->__unset('monarch_temp_org_id');
+                WC()->session->__unset('monarch_temp_user_id');
+            } else {
+                // Save permanent user data for logged-in users
+                update_user_meta($customer_id, '_monarch_org_id', $org_id);
+                update_user_meta($customer_id, '_monarch_user_id', $user_id);
+                update_user_meta($customer_id, '_monarch_paytoken_id', $paytoken_id);
+                update_user_meta($customer_id, '_monarch_connected_date', current_time('mysql'));
 
-            // Copy temp API credentials to permanent
-            $temp_api_key = get_user_meta($customer_id, '_monarch_temp_org_api_key', true);
-            $temp_app_id = get_user_meta($customer_id, '_monarch_temp_org_app_id', true);
-            if ($temp_api_key && $temp_app_id) {
-                update_user_meta($customer_id, '_monarch_org_api_key', $temp_api_key);
-                update_user_meta($customer_id, '_monarch_org_app_id', $temp_app_id);
+                // Copy temp API credentials to permanent
+                $temp_api_key = get_user_meta($customer_id, '_monarch_temp_org_api_key', true);
+                $temp_app_id = get_user_meta($customer_id, '_monarch_temp_org_app_id', true);
+                if ($temp_api_key && $temp_app_id) {
+                    update_user_meta($customer_id, '_monarch_org_api_key', $temp_api_key);
+                    update_user_meta($customer_id, '_monarch_org_app_id', $temp_app_id);
+                }
+
+                // Clean up temporary data
+                delete_user_meta($customer_id, '_monarch_temp_org_id');
+                delete_user_meta($customer_id, '_monarch_temp_user_id');
+                delete_user_meta($customer_id, '_monarch_temp_org_api_key');
+                delete_user_meta($customer_id, '_monarch_temp_org_app_id');
             }
-
-            // Clean up temporary data
-            delete_user_meta($customer_id, '_monarch_temp_org_id');
-            delete_user_meta($customer_id, '_monarch_temp_user_id');
-            delete_user_meta($customer_id, '_monarch_temp_org_api_key');
-            delete_user_meta($customer_id, '_monarch_temp_org_app_id');
 
             // Log bank connection
             $logger->log_customer_event('bank_connected', $customer_id, array(
@@ -839,10 +939,8 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
     public function ajax_check_bank_status() {
         check_ajax_referer('monarch_ach_nonce', 'nonce');
 
-        if (!is_user_logged_in()) {
-            wp_send_json_error('User must be logged in');
-        }
-
+        // Support both logged in users and guest checkout
+        $is_guest = !is_user_logged_in();
         $org_id = sanitize_text_field($_POST['org_id']);
 
         if (!$org_id) {
@@ -850,12 +948,27 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
         }
 
         try {
-            $customer_id = get_current_user_id();
+            if ($is_guest) {
+                // For guest checkout, verify session exists
+                if (!WC()->session || !WC()->session->get_session_cookie()) {
+                    wp_send_json_error('Session required for guest checkout');
+                    return;
+                }
+            } else {
+                $customer_id = get_current_user_id();
+            }
 
             // IMPORTANT: Use the PURCHASER's API credentials
             // The orgId must be associated with the security headers being used
-            $purchaser_api_key = get_user_meta($customer_id, '_monarch_temp_org_api_key', true);
-            $purchaser_app_id = get_user_meta($customer_id, '_monarch_temp_org_app_id', true);
+            if ($is_guest) {
+                // For guest checkout, credentials should be in session from organization creation
+                $temp_api_data = WC()->session->get('monarch_temp_api_data');
+                $purchaser_api_key = $temp_api_data['api']['sandbox']['api_key'] ?? null;
+                $purchaser_app_id = $temp_api_data['api']['sandbox']['app_id'] ?? null;
+            } else {
+                $purchaser_api_key = get_user_meta($customer_id, '_monarch_temp_org_api_key', true);
+                $purchaser_app_id = get_user_meta($customer_id, '_monarch_temp_org_app_id', true);
+            }
 
             // Use purchaser credentials if available, otherwise fall back to merchant credentials
             $api_key_to_use = $purchaser_api_key ?: $this->api_key;
@@ -1080,8 +1193,15 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
     public function ajax_manual_bank_entry() {
         check_ajax_referer('monarch_ach_nonce', 'nonce');
 
-        if (!is_user_logged_in()) {
-            wp_send_json_error('User must be logged in');
+        // Support both logged in users and guest checkout
+        $is_guest = !is_user_logged_in();
+        
+        if ($is_guest) {
+            // For guest checkout, require session for data storage
+            if (!WC()->session || !WC()->session->get_session_cookie()) {
+                wp_send_json_error('Session required for guest checkout');
+                return;
+            }
         }
 
         try {
@@ -1093,9 +1213,18 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
                 $this->testmode
             );
 
-            // Get current user data
-            $current_user = wp_get_current_user();
-            $customer_id = get_current_user_id();
+            // Get user data - support both logged in users and guest checkout
+            if ($is_guest) {
+                // For guest checkout, use billing email from form
+                $user_email = sanitize_email($_POST['billing_email']);
+                $user_id = 'guest_' . substr(md5($user_email . time()), 0, 8);
+                $customer_id = null; // No WordPress user ID for guests
+            } else {
+                $current_user = wp_get_current_user();
+                $customer_id = get_current_user_id();
+                $user_email = $current_user->user_email;
+                $user_id = $customer_id;
+            }
 
             // Validate required fields
             $bank_name = sanitize_text_field($_POST['bank_name']);
@@ -1120,13 +1249,12 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
             $dob = date('m/d/Y', strtotime($dob_raw));
 
             // Generate unique email for Monarch
-            $user_email = $current_user->user_email;
             $email_parts = explode('@', $user_email);
-            $unique_email = $email_parts[0] . '+wp' . $customer_id . '_' . time() . '@' . ($email_parts[1] ?? 'example.com');
+            $unique_email = $email_parts[0] . '+wp' . $user_id . '_' . time() . '@' . ($email_parts[1] ?? 'example.com');
 
             $customer_data = array(
-                'first_name' => $current_user->user_firstname ?: sanitize_text_field($_POST['billing_first_name']),
-                'last_name' => $current_user->user_lastname ?: sanitize_text_field($_POST['billing_last_name']),
+                'first_name' => $is_guest ? sanitize_text_field($_POST['billing_first_name']) : ($current_user->user_firstname ?: sanitize_text_field($_POST['billing_first_name'])),
+                'last_name' => $is_guest ? sanitize_text_field($_POST['billing_last_name']) : ($current_user->user_lastname ?: sanitize_text_field($_POST['billing_last_name'])),
                 'email' => $unique_email,
                 'password' => wp_generate_password(12, false),
                 'phone' => $phone,
@@ -1180,21 +1308,40 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
                 wp_send_json_error('Failed to link bank account: ' . $assign_result['error']);
             }
 
-            // Save permanent user data
-            update_user_meta($customer_id, '_monarch_org_id', $org_id);
-            update_user_meta($customer_id, '_monarch_user_id', $user_id);
-            update_user_meta($customer_id, '_monarch_paytoken_id', $paytoken_id);
-            update_user_meta($customer_id, '_monarch_connected_date', current_time('mysql'));
+            // Save permanent data based on user type
+            if ($is_guest) {
+                // For guest users, store in session (will be moved to order meta during checkout)
+                WC()->session->set('monarch_org_id', $org_id);
+                WC()->session->set('monarch_user_id', $user_id);
+                WC()->session->set('monarch_paytoken_id', $paytoken_id);
+                WC()->session->set('monarch_connected_date', current_time('mysql'));
+                
+                // Store the purchaser org's API credentials for transactions
+                $org_api = $org_result['data']['api'] ?? null;
+                if ($org_api) {
+                    $credentials_key = $this->testmode ? 'sandbox' : 'prod';
+                    $org_credentials = $org_api[$credentials_key] ?? null;
+                    if ($org_credentials) {
+                        WC()->session->set('monarch_org_api_key', $org_credentials['api_key']);
+                        WC()->session->set('monarch_org_app_id', $org_credentials['app_id']);
+                    }
+                }
+            } else {
+                // Save permanent user data for logged-in users
+                update_user_meta($customer_id, '_monarch_org_id', $org_id);
+                update_user_meta($customer_id, '_monarch_user_id', $user_id);
+                update_user_meta($customer_id, '_monarch_paytoken_id', $paytoken_id);
+                update_user_meta($customer_id, '_monarch_connected_date', current_time('mysql'));
 
-            // Store the purchaser org's API credentials for transactions
-            // The Monarch API requires using the purchaser's own credentials for sale transactions
-            $org_api = $org_result['data']['api'] ?? null;
-            if ($org_api) {
-                $credentials_key = $this->testmode ? 'sandbox' : 'prod';
-                $org_credentials = $org_api[$credentials_key] ?? null;
-                if ($org_credentials) {
-                    update_user_meta($customer_id, '_monarch_org_api_key', $org_credentials['api_key']);
-                    update_user_meta($customer_id, '_monarch_org_app_id', $org_credentials['app_id']);
+                // Store the purchaser org's API credentials for transactions
+                $org_api = $org_result['data']['api'] ?? null;
+                if ($org_api) {
+                    $credentials_key = $this->testmode ? 'sandbox' : 'prod';
+                    $org_credentials = $org_api[$credentials_key] ?? null;
+                    if ($org_credentials) {
+                        update_user_meta($customer_id, '_monarch_org_api_key', $org_credentials['api_key']);
+                        update_user_meta($customer_id, '_monarch_org_app_id', $org_credentials['app_id']);
+                    }
                 }
             }
 
@@ -1213,6 +1360,116 @@ class WC_Monarch_ACH_Gateway extends WC_Payment_Gateway {
 
         } catch (Exception $e) {
             wp_send_json_error('Manual bank entry failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Validate that a paytoken exists and can be used with the given credentials
+     * This prevents "Paytoken is Invalid" errors by verifying credential consistency
+     */
+    private function validate_paytoken_with_credentials($org_id, $paytoken_id, $api_key, $app_id) {
+        try {
+            $api_url = $this->testmode ? 'https://devapi.monarch.is/v1' : 'https://api.monarch.is/v1';
+            
+            // Try to get the organization details which includes paytokens
+            $response = wp_remote_get($api_url . '/organization/' . $org_id, array(
+                'headers' => array(
+                    'accept' => 'application/json',
+                    'X-API-KEY' => $api_key,
+                    'X-APP-ID' => $app_id
+                ),
+                'timeout' => 30
+            ));
+
+            if (is_wp_error($response)) {
+                return array(
+                    'valid' => false,
+                    'error' => 'Network error: ' . $response->get_error_message()
+                );
+            }
+
+            $status_code = wp_remote_retrieve_response_code($response);
+            $body = json_decode(wp_remote_retrieve_body($response), true);
+
+            if ($status_code < 200 || $status_code >= 300) {
+                $error_msg = $body['error']['message'] ?? $body['message'] ?? 'API error';
+                return array(
+                    'valid' => false,
+                    'error' => "API returned status $status_code: $error_msg"
+                );
+            }
+
+            // Check if the paytoken exists in the organization's paytokens
+            $paytokens = $body['payTokens'] ?? $body['paytokens'] ?? array();
+            
+            if (empty($paytokens)) {
+                return array(
+                    'valid' => false,
+                    'error' => 'No paytokens found for organization'
+                );
+            }
+
+            // Look for our specific paytoken
+            $paytoken_found = false;
+            foreach ($paytokens as $token) {
+                $token_id = '';
+                if (is_array($token)) {
+                    $token_id = $token['_id'] ?? $token['payToken'] ?? $token['id'] ?? '';
+                } else {
+                    $token_id = $token;
+                }
+                
+                if ($token_id === $paytoken_id) {
+                    $paytoken_found = true;
+                    break;
+                }
+            }
+
+            if (!$paytoken_found) {
+                return array(
+                    'valid' => false,
+                    'error' => "Paytoken $paytoken_id not found in organization's paytokens"
+                );
+            }
+
+            return array(
+                'valid' => true,
+                'error' => null
+            );
+
+        } catch (Exception $e) {
+            return array(
+                'valid' => false,
+                'error' => 'Validation exception: ' . $e->getMessage()
+            );
+        }
+    }
+
+    /**
+     * Get stored Monarch credentials for a user (supports both logged-in and guest users)
+     * Returns array with org_id, paytoken_id, api_key, app_id
+     */
+    private function get_user_monarch_credentials($customer_id, $is_guest = false, $temporary = false) {
+        $prefix = $temporary ? 'monarch_temp_' : 'monarch_';
+        
+        if ($is_guest) {
+            // For guest users, get from session
+            return array(
+                'org_id' => WC()->session->get($prefix . 'org_id'),
+                'paytoken_id' => WC()->session->get($prefix . 'paytoken_id'),
+                'api_key' => WC()->session->get($prefix . 'org_api_key'),
+                'app_id' => WC()->session->get($prefix . 'org_app_id'),
+                'user_id' => WC()->session->get($prefix . 'user_id')
+            );
+        } else {
+            // For logged-in users, get from user meta
+            return array(
+                'org_id' => get_user_meta($customer_id, '_' . $prefix . 'org_id', true),
+                'paytoken_id' => get_user_meta($customer_id, '_' . $prefix . 'paytoken_id', true),
+                'api_key' => get_user_meta($customer_id, '_' . $prefix . 'org_api_key', true),
+                'app_id' => get_user_meta($customer_id, '_' . $prefix . 'org_app_id', true),
+                'user_id' => get_user_meta($customer_id, '_' . $prefix . 'user_id', true)
+            );
         }
     }
 
